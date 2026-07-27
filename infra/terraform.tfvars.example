@@ -1,0 +1,5 @@
+master_authorized_networks = ["x.x.x.x/32"]
+datadog_api_key            = "your-datadog-api-key"
+
+# Optional. Uncomment to pin the AWS CLI profile used by the aws/helm providers.
+# aws_profile = "your-aws-profile"

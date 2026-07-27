@@ -1,0 +1,39 @@
+# in case of private repository
+#
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: eks-dd-repo-credentials
+#   namespace: argocd
+#   labels:
+#     argocd.argoproj.io/secret-type: repository # Argo CD automatically detect this label
+# stringData:
+#   type: git
+#   url: GITHUB_REPOSITORY_URI
+#   username: x-access-token
+#   password: <GitHub Personal Access Token>
+# ---
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: eks-dd-nginx
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: GITHUB_REPOSITORY_URI
+    targetRevision: main
+    path: k8s
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
