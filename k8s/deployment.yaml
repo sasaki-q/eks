@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: nginx
-          image: traefik/whoami:v1.10.2
+          image: nginx:1.27
           ports:
             - containerPort: 80
           resources:
