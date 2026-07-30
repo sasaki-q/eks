@@ -46,30 +46,6 @@ variable "private_subnet_cidrs" {
   default     = ["10.0.10.0/24", "10.0.11.0/24"]
 }
 
-variable "node_instance_type" {
-  description = "EC2 instance type for the managed node group"
-  type        = string
-  default     = "t3.medium"
-}
-
-variable "node_desired_size" {
-  description = "Desired number of worker nodes"
-  type        = number
-  default     = 2
-}
-
-variable "node_min_size" {
-  description = "Minimum number of worker nodes"
-  type        = number
-  default     = 1
-}
-
-variable "node_max_size" {
-  description = "Maximum number of worker nodes"
-  type        = number
-  default     = 3
-}
-
 variable "master_authorized_networks" {
   description = "CIDR blocks allowed to reach the public EKS API endpoint (e.g. [\"203.0.113.4/32\"])"
   type        = list(string)

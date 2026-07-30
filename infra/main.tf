@@ -12,10 +12,6 @@ terraform {
       source  = "hashicorp/helm"
       version = "~> 2.15"
     }
-    tls = {
-      source  = "hashicorp/tls"
-      version = "~> 4.0"
-    }
   }
 }
 
@@ -48,8 +44,12 @@ data "aws_eks_cluster_auth" "primary" {
   name = aws_eks_cluster.primary.name
 }
 
-data "tls_certificate" "eks_oidc" {
-  url = aws_eks_cluster.primary.identity[0].oidc[0].issuer
+data "aws_caller_identity" "current" {}
+
+# Resolves an assumed-role session ARN (e.g. AWS SSO) back to the underlying
+# IAM role ARN, which is what the EKS access entry principal_arn requires.
+data "aws_iam_session_context" "current" {
+  arn = data.aws_caller_identity.current.arn
 }
 
 ####################################################################################################
@@ -174,7 +174,7 @@ resource "aws_iam_role" "cluster" {
     Version = "2012-10-17"
     Statement = [{
       Effect    = "Allow"
-      Action    = "sts:AssumeRole"
+      Action    = ["sts:AssumeRole", "sts:TagSession"]
       Principal = { Service = "eks.amazonaws.com" }
     }]
   })
@@ -183,6 +183,28 @@ resource "aws_iam_role" "cluster" {
 resource "aws_iam_role_policy_attachment" "cluster_AmazonEKSClusterPolicy" {
   role       = aws_iam_role.cluster.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+}
+
+# Auto Mode delegates node provisioning, load balancing, and block storage
+# to the control plane, so its IAM role needs these on top of the base cluster policy.
+resource "aws_iam_role_policy_attachment" "cluster_AmazonEKSComputePolicy" {
+  role       = aws_iam_role.cluster.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSComputePolicy"
+}
+
+resource "aws_iam_role_policy_attachment" "cluster_AmazonEKSBlockStoragePolicy" {
+  role       = aws_iam_role.cluster.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSBlockStoragePolicy"
+}
+
+resource "aws_iam_role_policy_attachment" "cluster_AmazonEKSLoadBalancingPolicy" {
+  role       = aws_iam_role.cluster.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSLoadBalancingPolicy"
+}
+
+resource "aws_iam_role_policy_attachment" "cluster_AmazonEKSNetworkingPolicy" {
+  role       = aws_iam_role.cluster.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSNetworkingPolicy"
 }
 
 resource "aws_iam_role" "node" {
@@ -198,19 +220,16 @@ resource "aws_iam_role" "node" {
   })
 }
 
-resource "aws_iam_role_policy_attachment" "node_AmazonEKSWorkerNodePolicy" {
+# Auto Mode nodes only need the minimal worker + pull-only ECR policies;
+# CNI and full worker-node permissions are handled by the control plane.
+resource "aws_iam_role_policy_attachment" "node_AmazonEKSWorkerNodeMinimalPolicy" {
   role       = aws_iam_role.node.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodeMinimalPolicy"
 }
 
-resource "aws_iam_role_policy_attachment" "node_AmazonEKS_CNI_Policy" {
+resource "aws_iam_role_policy_attachment" "node_AmazonEC2ContainerRegistryPullOnly" {
   role       = aws_iam_role.node.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
-}
-
-resource "aws_iam_role_policy_attachment" "node_AmazonEC2ContainerRegistryReadOnly" {
-  role       = aws_iam_role.node.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly"
 }
 
 ####################################################################################################
@@ -218,9 +237,17 @@ resource "aws_iam_role_policy_attachment" "node_AmazonEC2ContainerRegistryReadOn
 ####################################################################################################
 
 resource "aws_eks_cluster" "primary" {
-  name     = var.cluster_name
-  role_arn = aws_iam_role.cluster.arn
-  version  = var.kubernetes_version
+  name                          = var.cluster_name
+  role_arn                      = aws_iam_role.cluster.arn
+  version                       = var.kubernetes_version
+  bootstrap_self_managed_addons = false
+
+  # EKS only allows CONFIG_MAP -> API_AND_CONFIG_MAP -> API, one step at a time;
+  # this cluster currently has no access_config (defaults to CONFIG_MAP), so
+  # jumping straight to "API" would be rejected on the existing cluster.
+  access_config {
+    authentication_mode = "API_AND_CONFIG_MAP"
+  }
 
   vpc_config {
     subnet_ids              = concat(aws_subnet.public[*].id, aws_subnet.private[*].id)
@@ -229,110 +256,56 @@ resource "aws_eks_cluster" "primary" {
     public_access_cidrs     = var.master_authorized_networks
   }
 
-  depends_on = [aws_iam_role_policy_attachment.cluster_AmazonEKSClusterPolicy]
-}
+  # Auto Mode: control plane provisions and manages worker nodes directly,
+  # replacing the self-managed node group.
+  compute_config {
+    enabled       = true
+    node_pools    = ["general-purpose"]
+    node_role_arn = aws_iam_role.node.arn
+  }
 
-# Managed node group placed in private subnets only; nodes get no public IP,
-resource "aws_eks_node_group" "primary" {
-  cluster_name    = aws_eks_cluster.primary.name
-  node_group_name = "${var.cluster_name}-ng"
-  node_role_arn   = aws_iam_role.node.arn
-  subnet_ids      = aws_subnet.private[*].id
-  instance_types  = [var.node_instance_type]
+  kubernetes_network_config {
+    elastic_load_balancing {
+      enabled = true
+    }
+  }
 
-  scaling_config {
-    desired_size = var.node_desired_size
-    min_size     = var.node_min_size
-    max_size     = var.node_max_size
+  storage_config {
+    block_storage {
+      enabled = true
+    }
   }
 
   depends_on = [
-    aws_iam_role_policy_attachment.node_AmazonEKSWorkerNodePolicy,
-    aws_iam_role_policy_attachment.node_AmazonEKS_CNI_Policy,
-    aws_iam_role_policy_attachment.node_AmazonEC2ContainerRegistryReadOnly,
+    aws_iam_role_policy_attachment.cluster_AmazonEKSClusterPolicy,
+    aws_iam_role_policy_attachment.cluster_AmazonEKSComputePolicy,
+    aws_iam_role_policy_attachment.cluster_AmazonEKSBlockStoragePolicy,
+    aws_iam_role_policy_attachment.cluster_AmazonEKSLoadBalancingPolicy,
+    aws_iam_role_policy_attachment.cluster_AmazonEKSNetworkingPolicy,
+    aws_iam_role_policy_attachment.node_AmazonEKSWorkerNodeMinimalPolicy,
+    aws_iam_role_policy_attachment.node_AmazonEC2ContainerRegistryPullOnly,
   ]
 }
 
-####################################################################################################
-# AWS LOAD BALANCER CONTROLLER
-####################################################################################################
-
-# OIDC provider for the cluster; required so pod service accounts can assume
-# IAM roles directly (IRSA) instead of inheriting the node's IAM role.
-resource "aws_iam_openid_connect_provider" "eks" {
-  client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = [data.tls_certificate.eks_oidc.certificates[0].sha1_fingerprint]
-  url             = aws_eks_cluster.primary.identity[0].oidc[0].issuer
+# Switching authentication_mode off CONFIG_MAP-only drops the implicit
+# "cluster creator" system:masters bootstrap; without an explicit access
+# entry the calling principal loses all cluster access (kubectl/helm).
+resource "aws_eks_access_entry" "current_caller" {
+  cluster_name  = aws_eks_cluster.primary.name
+  principal_arn = data.aws_iam_session_context.current.issuer_arn
+  type          = "STANDARD"
 }
 
-resource "aws_iam_policy" "aws_load_balancer_controller" {
-  name   = "${var.cluster_name}-aws-load-balancer-controller"
-  policy = file("${path.module}/iam/aws-load-balancer-controller-policy.json")
-}
+resource "aws_eks_access_policy_association" "current_caller_admin" {
+  cluster_name  = aws_eks_cluster.primary.name
+  principal_arn = data.aws_iam_session_context.current.issuer_arn
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
 
-# Trusts only the aws-load-balancer-controller service account in kube-system,
-# scoped via the OIDC provider's sub/aud claims (IRSA).
-resource "aws_iam_role" "aws_load_balancer_controller" {
-  name = "${var.cluster_name}-aws-load-balancer-controller"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Action    = "sts:AssumeRoleWithWebIdentity"
-      Principal = { Federated = aws_iam_openid_connect_provider.eks.arn }
-      Condition = {
-        StringEquals = {
-          "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:sub" = "system:serviceaccount:kube-system:aws-load-balancer-controller"
-          "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:aud" = "sts.amazonaws.com"
-        }
-      }
-    }]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "aws_load_balancer_controller" {
-  role       = aws_iam_role.aws_load_balancer_controller.name
-  policy_arn = aws_iam_policy.aws_load_balancer_controller.arn
-}
-
-resource "helm_release" "aws_load_balancer_controller" {
-  name       = "aws-load-balancer-controller"
-  repository = "https://aws.github.io/eks-charts"
-  chart      = "aws-load-balancer-controller"
-  namespace  = "kube-system"
-
-  set {
-    name  = "clusterName"
-    value = var.cluster_name
+  access_scope {
+    type = "cluster"
   }
 
-  set {
-    name  = "region"
-    value = var.region
-  }
-
-  set {
-    name  = "vpcId"
-    value = aws_vpc.main.id
-  }
-
-  set {
-    name  = "serviceAccount.create"
-    value = "true"
-  }
-
-  set {
-    name  = "serviceAccount.name"
-    value = "aws-load-balancer-controller"
-  }
-
-  set {
-    name  = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
-    value = aws_iam_role.aws_load_balancer_controller.arn
-  }
-
-  depends_on = [aws_eks_node_group.primary, aws_iam_role_policy_attachment.aws_load_balancer_controller]
+  depends_on = [aws_eks_access_entry.current_caller]
 }
 
 ####################################################################################################
@@ -346,35 +319,15 @@ resource "helm_release" "datadog" {
   namespace        = "datadog"
   create_namespace = true
 
-  set {
-    name  = "datadog.apiKey"
-    value = var.datadog_api_key
-  }
+  values = [
+    templatefile("${path.module}/datadog.yaml", {
+      api_key      = var.datadog_api_key
+      site         = var.datadog_site
+      cluster_name = var.cluster_name
+    })
+  ]
 
-  set {
-    name  = "datadog.site"
-    value = var.datadog_site
-  }
-
-  set {
-    name  = "datadog.clusterName"
-    value = var.cluster_name
-  }
-
-  set {
-    name  = "datadog.logs.enabled"
-    value = "true"
-  }
-
-  set {
-    name  = "datadog.logs.containerCollectAll"
-    value = "true"
-  }
-
-  # aws-load-balancer-controller's mutating webhook intercepts every Service
-  # create cluster-wide; if its pod isn't Ready yet, this release's Service
-  # creation fails with "no endpoints available for ...webhook-service".
-  depends_on = [aws_eks_node_group.primary, helm_release.aws_load_balancer_controller]
+  depends_on = [aws_eks_cluster.primary, aws_eks_access_policy_association.current_caller_admin]
 }
 
 ####################################################################################################
@@ -388,6 +341,5 @@ resource "helm_release" "argocd" {
   namespace        = "argocd"
   create_namespace = true
 
-  # Same webhook-ordering reason as helm_release.datadog above.
-  depends_on = [aws_eks_node_group.primary, helm_release.aws_load_balancer_controller]
+  depends_on = [aws_eks_cluster.primary, aws_eks_access_policy_association.current_caller_admin]
 }

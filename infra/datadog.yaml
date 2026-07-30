@@ -1,0 +1,19 @@
+datadog:
+  apiKey: "${api_key}"
+  clusterName: "${cluster_name}"
+  site: "${site}"
+
+  logs:
+    enabled: true
+    containerCollectAll: true
+
+  clusterChecksRunner:
+    enabled: true
+
+kubeStateMetrics:
+  enabled: false
+
+clusterAgent:
+  enabled: true
+  metricsProvider:
+    enabled: true
