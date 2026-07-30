@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-a
+  namespace: default
+  labels:
+    app: api-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-a
+  template:
+    metadata:
+      labels:
+        app: api-a
+    spec:
+      containers:
+        - name: api-a
+          image: IMAGE_URI
+          ports:
+            - containerPort: 8080
+          env:
+            - name: SERVICE_NAME
+              value: api-a
+            - name: PORT
+              value: "8080"
+            - name: INTERACTED_POD_URI
+              value: http://api-b-svc
+            - name: PATH_PREFIX
+              value: api-a
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-a-svc
+  namespace: default
+  labels:
+    app: api-a
+spec:
+  type: ClusterIP
+  selector:
+    app: api-a
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP

@@ -27,7 +27,7 @@ rm-state:
 
 CLUSTER_NAME=eks-dd-test
 REGION=ap-northeast-1
-PROFILE=default
+PROFILE=dummy
 
 sso-login:
 	aws sso login --profile ${PROFILE}
@@ -46,3 +46,24 @@ delete-manifest: get-credentials
 
 delete-argocd: get-credentials
 	kubectl delete -f argocd/
+
+ECR_REPO=eks-dd
+IMAGE_NAME=api
+IMAGE_TAG=v1.0.0
+ACCOUNT_ID=dummy
+IMAGE=${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}/${IMAGE_NAME}:${IMAGE_TAG}
+
+create-ecr-repo:
+	aws ecr create-repository \
+		--repository-name ${ECR_REPO}/${IMAGE_NAME} \
+		--region ${REGION} \
+		--profile ${PROFILE}
+
+ecr-login:
+	aws ecr get-login-password --region ${REGION} --profile ${PROFILE} | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com
+
+build:
+	docker buildx build -t ${IMAGE} -f cmd/Dockerfile cmd
+
+push: build ecr-login
+	docker push ${IMAGE}

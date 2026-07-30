@@ -7,9 +7,12 @@ EKS + Datadog + Argo CD を組み合わせたテスト用プロジェクト。Te
 ```
 infra/   Terraform 一式 (VPC, EKS クラスタ [Auto Mode], NAT Gateway, Datadog Agent, Argo CD)
          infra/datadog.yaml は Datadog Helm chart 用の values ファイル (templatefile でAPIキー等を埋め込む)
+cmd/     サンプル API (Go)。ECR にビルド・push して api-a / api-b としてデプロイする
 k8s/     テストアプリの Kubernetes manifest
-         ingress.yaml : ロードバランサー定義 (IngressClassParams + IngressClass + ALB Ingress)
-         nginx.yaml   : サービス定義 (nginx Deployment + ClusterIP Service)
+         alb.yaml   : ロードバランサー定義 (IngressClassParams + IngressClass + ALB Ingress)
+         nginx.yaml : nginx の Deployment + ClusterIP Service
+         api-a.yaml : api-a の Deployment + ClusterIP Service (cmd/ のイメージ)
+         api-b.yaml : api-b の Deployment + ClusterIP Service (cmd/ のイメージ)
            Argo CD がこのディレクトリを watch する
 argocd/  Argo CD の Application 定義 (このリポジトリの k8s/ を同期対象にする)
 Makefile よく使う操作をまとめたコマンド集
@@ -29,6 +32,9 @@ Makefile よく使う操作をまとめたコマンド集
   - Auto Mode はセルフマネージドの AWS Load Balancer Controller と異なり `IngressClass`/`IngressClassParams` を自動作成しないため、`k8s/ingress.yaml` で明示的に定義している (`controller: eks.amazonaws.com/alb`)。ALBのscheme (internet-facing/internal) は `IngressClassParams.spec.scheme` で指定し、`alb.ingress.kubernetes.io/scheme` アノテーションでは設定できない
   - `Ingress` に `alb.ingress.kubernetes.io/target-type: ip` を付けているため、ALB は Pod の IP に直接トラフィックを転送する (private subnet 上の Pod へ直配送。ノードのポート経由ではない)
   - IRSA/OIDC プロバイダは不要 (Auto Mode の ALB 機能はコントロールプレーンが直接処理するため)
+- `cmd/` は Pod 間通信のデモ用サンプル API (Go)。同じイメージを `api-a` / `api-b` として2つデプロイし、`INTERACTED_POD_URI` (相手の ClusterIP Service) 経由でお互いに `/interact` を呼び合う
+  - ALB はパスの書き換え(rewrite)を行わないため、`/api-a/service` のようにプレフィックス付きのパスがそのまま Pod に転送される。そのためアプリ側で `PATH_PREFIX` 環境変数を使い `/{PATH_PREFIX}/service` のようにプレフィックス込みでルートを登録している
+  - ALB は Ingress に書かれた**順序**でリスナールールの優先順位を決める (パスの詳細度では自動的に並び替えない)。`k8s/alb.yaml` では `/api-a` `/api-b` を、catch-all の `/` (nginx) より**前**に書く必要がある。逆順にすると `/api-a/service` などのリクエストも `/` にマッチして nginx に転送され、404 になる
 - Datadog Agent (DaemonSet) と Cluster Agent を Helm 経由でデプロイ。値は `infra/datadog.yaml` に切り出し、`templatefile()` で APIキー・site・cluster名を埋め込んで渡している
 - Argo CD を Helm 経由でデプロイし、GitHub リポジトリの `k8s/` を `syncPolicy.automated` (prune + selfHeal) で自動同期
   - 同期方式は Git polling (デフォルトで数分ごとにリポジトリを確認)。GitHub Actions 側の変更や Argo CD server の外部公開は不要
@@ -86,6 +92,25 @@ kubectl get application -n argocd
 kubectl get ingress nginx
 ```
 
+`api-a` / `api-b` は同じ ALB のパスベースルーティングで公開している。
+
+```
+curl http://<ALBのDNS名>/api-a/service
+curl http://<ALBのDNS名>/api-a/interact
+curl http://<ALBのDNS名>/api-b/service
+```
+
+## サンプル API (cmd/) のビルド・ECR push
+
+`cmd/` の Go アプリをビルドして ECR に push し、`k8s/api-a.yaml` / `k8s/api-b.yaml` の `image` に指定する。
+
+```
+make create-ecr-repo ACCOUNT_ID=<AWSアカウントID> PROFILE=<プロファイル名>
+make push ACCOUNT_ID=<AWSアカウントID> PROFILE=<プロファイル名> IMAGE_TAG=<任意のタグ>
+```
+
+push 後、`k8s/api-a.yaml` / `k8s/api-b.yaml` の `image` を push したイメージ (`${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}/${IMAGE_NAME}:${IMAGE_TAG}`) に書き換え、`main` にマージする (Argo CD が自動同期する)。
+
 ## Datadog での確認
 
 ```
@@ -111,8 +136,13 @@ kubectl get pods -n datadog
 | `make get-credentials` | kubectl の context を EKS クラスタに合わせる (`aws eks update-kubeconfig`) |
 | `make apply-manifest` | context を合わせてから `kubectl apply -f k8s/` (手動デプロイ用。通常は Argo CD が自動同期する) |
 | `make apply-argocd` | context を合わせてから `kubectl apply -f argocd/` (Application の登録・更新) |
+| `make create-ecr-repo` | `cmd/` 用の ECR リポジトリ (`${ECR_REPO}/${IMAGE_NAME}`) を作成 |
+| `make build` | `cmd/Dockerfile` から `cmd/` をビルド (`docker buildx build`) |
+| `make push` | ECR にログインしてイメージを push (`build` に依存) |
 
-`get-credentials` / `apply-manifest` / `apply-argocd` は Makefile 内の `CLUSTER_NAME` / `REGION` / `PROFILE` (デフォルトそれぞれ `eks-dd-test` / `ap-northeast-1` / `default`) を使うため、必要に応じて実行時に上書きすること (例: `make get-credentials PROFILE=myprofile`)。
+`create-ecr-repo` / `build` / `push` は `ECR_REPO` (デフォルト `eks-dd`) / `IMAGE_NAME` (デフォルト `api`) / `IMAGE_TAG` (デフォルト `v1.0.0`) / `ACCOUNT_ID` を使うため、`make push ACCOUNT_ID=123456789012 PROFILE=myprofile IMAGE_TAG=v1.0.1` のように実行時に指定すること。
+
+`get-credentials` / `apply-manifest` / `apply-argocd` は Makefile 内の `CLUSTER_NAME` / `REGION` / `PROFILE` (デフォルトそれぞれ `eks-dd-test` / `ap-northeast-1` / `your-profile`) を使うため、必要に応じて実行時に上書きすること (例: `make get-credentials PROFILE=myprofile`)。
 
 ## 注意事項
 

@@ -31,6 +31,24 @@ spec:
   rules:
     - http:
         paths:
+          - path: /api-a
+            pathType: Prefix
+            backend:
+              service:
+                name: api-a-svc
+                port:
+                  number: 80
+    - http:
+        paths:
+          - path: /api-b
+            pathType: Prefix
+            backend:
+              service:
+                name: api-b-svc
+                port:
+                  number: 80
+    - http:
+        paths:
           - path: /
             pathType: Prefix
             backend:
